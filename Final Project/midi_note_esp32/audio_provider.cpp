@@ -1,105 +1,167 @@
 #include "audio_provider.h"
 
 #include <Arduino.h>
-#include <PDM.h>
 #include <math.h>
 #include <string.h>
 
 #include "model_params.h"
 
 // ---------------------------------------------------------------------------
-// Microphone gain. The log-frequency features are gain-invariant by
-// construction, so this only has to put the signal comfortably above the noise
-// floor and below clipping. 20 is the library default; 40-50 suits a guitar at
-// ~30 cm. It does NOT need calibrating the way a linear-magnitude front end
-// would.
+// Pin map -- edit to match your wiring.
 // ---------------------------------------------------------------------------
-static const int kPdmGain = 40;
+#define I2S_PIN_BCLK 14
+#define I2S_PIN_WS   15
+#define I2S_PIN_DIN  32
+
+// ---------------------------------------------------------------------------
+// Microphone gain.
+//
+// The INMP441 is a 24-bit part; we normalize by 2^31 so a full-scale acoustic
+// input maps to +/-1.0, matching tf.audio.decode_wav. In practice a MEMS mic
+// at conversational distance sits far below full scale, so this multiplier
+// brings the level into the range the model was trained on.
+//
+// START AT 1.0, run the sketch, and watch the RMS figure printed by the
+// serial output while you play a note. Aim for RMS in the 0.02-0.20 band --
+// roughly where the training WAVs sit. Then set kMicGain accordingly.
+// ---------------------------------------------------------------------------
+float kMicGain = 8.0f;
+
+// ---------------------------------------------------------------------------
+// The Arduino ESP32 core changed its I2S API in v3.x (ESP-IDF 5.x). Both
+// paths are here so this compiles either way.
+// ---------------------------------------------------------------------------
+#include "esp_arduino_version.h"
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  #include "driver/i2s_std.h"
+  static i2s_chan_handle_t g_rx_handle = nullptr;
+#else
+  #include "driver/i2s.h"
+  static const i2s_port_t kI2SPort = I2S_NUM_0;
+#endif
 
 namespace {
 
-// Ring buffer sized well beyond one window so an occasional slow inference does
-// not immediately corrupt the frame being assembled.
-constexpr int kRingSamples = 4096;          // 256 ms at 16 kHz
+constexpr int kDmaFrames  = 256;
+constexpr int kDmaBuffers = 8;      // 8 * 256 / 16000 = 128 ms of slack
 
-volatile int16_t  g_ring[kRingSamples];
-volatile uint32_t g_write = 0;              // total samples ever written
-volatile uint32_t g_read  = 0;              // total samples consumed
-volatile uint32_t g_overruns = 0;
-
-int16_t g_isr_buf[512];
+float   g_window[kWindowSamples];
+int32_t g_raw[kWindowSamples];      // scratch for one hop of I2S words
 float   g_last_rms = 0.0f;
-bool    g_primed = false;
-
-void OnPdmData() {
-  const int bytes = PDM.available();
-  if (bytes <= 0) return;
-  const int n = (bytes > (int)sizeof(g_isr_buf)) ? (int)sizeof(g_isr_buf) : bytes;
-  PDM.read((void*)g_isr_buf, n);
-
-  const int samples = n / 2;
-  for (int i = 0; i < samples; i++) {
-    g_ring[(g_write + i) % kRingSamples] = g_isr_buf[i];
-  }
-  g_write += samples;
-}
+bool    g_primed   = false;
 
 }  // namespace
 
 bool AudioProviderInit() {
-  memset((void*)g_ring, 0, sizeof(g_ring));
-  g_write = g_read = g_overruns = 0;
+  memset(g_window, 0, sizeof(g_window));
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  i2s_chan_config_t chan_cfg =
+      I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  chan_cfg.dma_desc_num  = kDmaBuffers;
+  chan_cfg.dma_frame_num = kDmaFrames;
+  if (i2s_new_channel(&chan_cfg, nullptr, &g_rx_handle) != ESP_OK) return false;
+
+  i2s_std_config_t std_cfg = {
+      .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate),
+      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
+                                                      I2S_SLOT_MODE_MONO),
+      .gpio_cfg = {
+          .mclk = I2S_GPIO_UNUSED,
+          .bclk = (gpio_num_t)I2S_PIN_BCLK,
+          .ws   = (gpio_num_t)I2S_PIN_WS,
+          .dout = I2S_GPIO_UNUSED,
+          .din  = (gpio_num_t)I2S_PIN_DIN,
+          .invert_flags = {false, false, false},
+      },
+  };
+  // L/R tied to GND -> the mic transmits in the left slot.
+  std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+  if (i2s_channel_init_std_mode(g_rx_handle, &std_cfg) != ESP_OK) return false;
+  if (i2s_channel_enable(g_rx_handle) != ESP_OK) return false;
+
+#else
+  i2s_config_t cfg = {};
+  cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+  cfg.sample_rate          = kSampleRate;
+  cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT;
+  cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count        = kDmaBuffers;
+  cfg.dma_buf_len          = kDmaFrames;
+  cfg.use_apll             = false;
+  cfg.tx_desc_auto_clear   = false;
+  cfg.fixed_mclk           = 0;
+
+  i2s_pin_config_t pins = {};
+  pins.bck_io_num   = I2S_PIN_BCLK;
+  pins.ws_io_num    = I2S_PIN_WS;
+  pins.data_out_num = I2S_PIN_NO_CHANGE;
+  pins.data_in_num  = I2S_PIN_DIN;
+
+  if (i2s_driver_install(kI2SPort, &cfg, 0, nullptr) != ESP_OK) return false;
+  if (i2s_set_pin(kI2SPort, &pins) != ESP_OK) return false;
+  i2s_zero_dma_buffer(kI2SPort);
+#endif
+
   g_primed = false;
-
-  PDM.onReceive(OnPdmData);
-  PDM.setBufferSize(sizeof(g_isr_buf));
-  PDM.setGain(kPdmGain);
-
-  if (!PDM.begin(1, kSampleRate)) return false;   // 1 channel, 16 kHz
   return true;
 }
 
 bool AudioProviderReadWindow(float* out, int hop) {
   if (hop <= 0 || hop > kWindowSamples) return false;
 
-  // Wait until a full window exists (first call) or `hop` fresh samples have
-  // arrived (subsequent calls).
-  const uint32_t need = g_primed ? (g_read + hop) : (uint32_t)kWindowSamples;
-  while (g_write < need) {
-    yield();
+  // On the very first call, fill the whole window so we do not classify a
+  // buffer that is mostly zeros.
+  const int want = g_primed ? hop : kWindowSamples;
+
+  int filled = 0;
+  while (filled < want) {
+    const int chunk = want - filled;
+    size_t bytes_read = 0;
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    if (i2s_channel_read(g_rx_handle, g_raw + filled, chunk * sizeof(int32_t),
+                         &bytes_read, portMAX_DELAY) != ESP_OK) {
+      return false;
+    }
+#else
+    if (i2s_read(kI2SPort, g_raw + filled, chunk * sizeof(int32_t),
+                 &bytes_read, portMAX_DELAY) != ESP_OK) {
+      return false;
+    }
+#endif
+    if (bytes_read == 0) return false;
+    filled += (int)(bytes_read / sizeof(int32_t));
   }
 
-  noInterrupts();
-  const uint32_t w = g_write;
-  interrupts();
-
-  // If we fell far enough behind that the oldest sample we still want has been
-  // overwritten, abandon the backlog and take the newest window instead. This
-  // is the behaviour that keeps latency bounded on a slow core.
-  if (w - g_read > (uint32_t)kRingSamples) {
-    g_overruns += (w - g_read) - kRingSamples;
-    g_read = w - kWindowSamples;
+  // Slide the window left by `want` and append the new samples.
+  if (want < kWindowSamples) {
+    memmove(g_window, g_window + want,
+            (kWindowSamples - want) * sizeof(float));
   }
 
-  // Copy the most recent kWindowSamples, oldest first.
-  const uint32_t start = w - kWindowSamples;
+  float* tail = g_window + (kWindowSamples - want);
+  for (int i = 0; i < want; i++) {
+    // The INMP441 places its 24-bit sample in the upper bits of the 32-bit
+    // slot. Dividing by 2^31 normalizes to [-1, 1] in one step and keeps the
+    // low bits, which matters because we are looking at low-level harmonics.
+    tail[i] = ((float)g_raw[i] / 2147483648.0f) * kMicGain;
+  }
+
+  g_primed = true;
+
   double acc = 0.0;
   for (int i = 0; i < kWindowSamples; i++) {
-    noInterrupts();
-    const int16_t s = g_ring[(start + i) % kRingSamples];
-    interrupts();
-    // int16 -> [-1, 1], matching tf.audio.decode_wav's PCM_16 convention.
-    const float v = (float)s / 32768.0f;
-    out[i] = v;
-    acc += (double)v * (double)v;
+    acc += (double)g_window[i] * (double)g_window[i];
   }
   g_last_rms = (float)sqrt(acc / kWindowSamples);
 
-  g_read = w;          // consume everything up to now; backlog is discarded
-  g_primed = true;
+  memcpy(out, g_window, kWindowSamples * sizeof(float));
   return true;
 }
 
 float AudioProviderLastRms() { return g_last_rms; }
-
-uint32_t AudioProviderOverruns() { return g_overruns; }

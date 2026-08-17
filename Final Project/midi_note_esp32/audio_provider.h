@@ -1,33 +1,30 @@
-// audio_provider.h -- PDM microphone capture for the Arduino Nano 33 BLE Sense.
+// audio_provider.h -- I2S capture for INMP441 / SPH0645 on ESP32.
 //
-// IMPORTANT: the plain "Nano 33 BLE" has NO microphone. Only the "Nano 33 BLE
-// Sense" (rev 1 or rev 2) carries the MP34DT05/MP34DT06 PDM mic. On a non-Sense
-// board this file compiles but captures nothing.
+// Replaces Lab 5's arduino_audio_provider.cpp, which is built on the Nano 33
+// BLE's PDM library and does not exist on Xtensa.
 //
-// Differences from the ESP32 version, and why they matter here:
+// ---- Wiring (INMP441) ----------------------------------------------------
+//   INMP441        ESP32
+//   -------        -----
+//   VDD            3V3        (NOT 5V)
+//   GND            GND
+//   SCK  (BCLK)    GPIO14
+//   WS   (LRCL)    GPIO15
+//   SD   (DOUT)    GPIO32
+//   L/R            GND        -> mic drives the LEFT slot
 //
-//   * The PDM library delivers samples from an interrupt, so capture is
-//     decoupled from the main loop. On a 64 MHz M4 the inference can take
-//     longer than the hop, so the ring buffer WILL overrun sometimes.
-//   * On overrun we drop the backlog and keep the newest audio rather than
-//     queueing it. A pitch detector that reports notes from three seconds ago
-//     is worse than one that skips frames.
+// Change the pins in audio_provider.cpp if you wired it differently.
 
 #pragma once
 
-#include <stdint.h>
-
-// Starts the PDM microphone at kSampleRate, mono. Returns false on failure.
+// Starts the I2S peripheral. Returns false on driver failure.
 bool AudioProviderInit();
 
-// Blocks until at least `hop` new samples have arrived, then writes the most
-// recent kWindowSamples into `out` as floats in [-1, 1] (matching
-// tf.audio.decode_wav). Returns false only on a hard failure.
+// Blocks until `hop` new samples have arrived, then slides the internal
+// window and copies the most recent kWindowSamples into `out` as floats
+// scaled to match tf.audio.decode_wav's [-1, 1] convention (with kMicGain
+// applied). Returns false on an I2S read error.
 bool AudioProviderReadWindow(float* out, int hop);
 
-// RMS of the window most recently returned.
+// RMS of the window most recently returned. Cheap energy gate input.
 float AudioProviderLastRms();
-
-// Number of samples dropped because the main loop could not keep up. Non-zero
-// means the hop is shorter than the processing time -- raise kHopSamples.
-uint32_t AudioProviderOverruns();
